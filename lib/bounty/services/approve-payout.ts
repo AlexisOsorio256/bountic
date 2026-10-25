@@ -1,6 +1,6 @@
 import "server-only";
 
-import { resolveAndPayout } from "@/lib/bounty/services/payout";
+import { resolveAndPayoutSplit } from "@/lib/bounty/services/payout";
 import { syncGithubBountyArtifacts } from "@/lib/bounty/services/github-sync";
 import { getSupabaseServiceClient } from "@/lib/clients/supabase/server";
 import { getGithubInstallationClient, getGithubRepoInstallationId } from "@/lib/clients/github/server";
@@ -57,8 +57,8 @@ export async function approveBountyPayout(params: {
     }
   }
 
-  // only single payout for now, later multiple payouts
-  const payoutResult = await resolveAndPayout({
+  // one payout per wallet declared in the winning PR (split tag), else a single payout
+  const splitResult = await resolveAndPayoutSplit({
     owner: params.owner,
     repo: params.repo,
     issueNumber: params.issueNumber,
@@ -68,13 +68,19 @@ export async function approveBountyPayout(params: {
     issueId,
   });
 
+  const payoutResult = splitResult.results[0];
+  const isSplit = splitResult.results.length > 1;
+  const txHashes = splitResult.results
+    .map((result) => result.txHash)
+    .filter((hash): hash is string => Boolean(hash));
+
   const now = new Date().toISOString();
 
   const { error: updateError } = await supabase
     .from("bounties")
     .update({
       status: "PAID",
-      payout_tx_hash: payoutResult.txHash,
+      payout_tx_hash: isSplit ? txHashes.join(",") : payoutResult.txHash,
       paid_at: now,
       approved_by: params.approvedBy,
     })
@@ -84,21 +90,25 @@ export async function approveBountyPayout(params: {
     throw new Error(`Failed to update bounty status to PAID: ${updateError.message}`);
   }
 
-  const { error: payoutEventError } = await supabase.from("payout_events").insert({
+  const payoutEvents = splitResult.results.map((result, index) => ({
     issue_id: issueId,
     recipient_username: bounty.winning_pr_author,
-    amount: bounty.total_amount,
-    locus_transaction_id: payoutResult.transactionId,
-    transaction_hash: payoutResult.txHash,
+    amount: splitResult.shares[index]?.amount ?? bounty.total_amount,
+    locus_transaction_id: result.transactionId,
+    transaction_hash: result.txHash,
     status: "SUCCESS",
     metadata: {
       approved_by: params.approvedBy,
       payout_source: "web",
-      payout_type: payoutResult.payoutType,
-      recipient_email: payoutResult.recipientEmail,
-      recipient_wallet: payoutResult.recipientWallet,
+      payout_type: result.payoutType,
+      recipient_email: result.recipientEmail,
+      recipient_wallet: result.recipientWallet,
+      split_index: index,
+      split_total: splitResult.results.length,
     },
-  });
+  }));
+
+  const { error: payoutEventError } = await supabase.from("payout_events").insert(payoutEvents);
 
   if (payoutEventError) {
     throw new Error(`Failed to persist payout event: ${payoutEventError.message}`);
