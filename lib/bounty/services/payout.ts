@@ -4,6 +4,7 @@ import { getLocusServerClient } from "@/lib/clients/locus/server";
 import { getSupabaseServiceClient } from "@/lib/clients/supabase/server";
 import { getSupabaseServerEnv } from "@/lib/env/server";
 import { getGithubInstallationClient, getGithubRepoInstallationId } from "@/lib/clients/github/server";
+import { parseWalletSplits, splitAmount } from "@/lib/bounty/services/wallet-split";
 
 const BOUNTIC_ADDRESS_REGEX = /<!--\s*bountic-address:\s*(0x[a-fA-F0-9]{40})\s*-->/i;
 
@@ -173,4 +174,46 @@ export async function resolveAndPayout(params: {
     amount: params.amount,
     issueId: params.issueId,
   });
+}
+export type SplitPayoutResult = {
+  results: PayoutResult[];
+  shares: { address: string; amount: number }[];
+};
+
+/**
+ * Pay every wallet declared in a `bountic-splits` tag on the winning PR.
+ *
+ * Falls back to `resolveAndPayout` (single recipient) when the PR does not
+ * declare a split, so existing bounties keep their behaviour.
+ */
+export async function resolveAndPayoutSplit(params: {
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  winningPrAuthor: string;
+  winningPrBody: string | null;
+  amount: number;
+  issueId: string;
+}): Promise<SplitPayoutResult> {
+  const shares = parseWalletSplits(params.winningPrBody);
+
+  if (!shares) {
+    const single = await resolveAndPayout(params);
+    return { results: [single], shares: [{ address: single.recipientWallet ?? "", amount: params.amount }] };
+  }
+
+  const amounts = splitAmount(params.amount, shares);
+  const results: PayoutResult[] = [];
+
+  for (const slice of amounts) {
+    results.push(
+      await callLocusPayoutByWallet({
+        toAddress: slice.address,
+        amount: slice.amount,
+        memo: `Bountic split payout for ${params.issueId}`,
+      }),
+    );
+  }
+
+  return { results, shares: amounts };
 }
